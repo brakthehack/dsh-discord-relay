@@ -1,0 +1,10 @@
+name: dsh-discord-relay
+version: 0.1.0
+description: >-
+  Relay DeepSeek Harness agent questions to your configured Discord channel
+  (set channelId in the config file) with clickable option buttons (plus a
+  type-your-own-answer modal), and return the owner's answer to the blocked
+  agent over the local dsh bridge.
+author: dsh-discord-relay contributors
+kind: standalone
+provides_tools: []

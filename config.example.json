@@ -1,0 +1,9 @@
+{
+  "_readme": "Copy to ~/.config/dsh-discord-relay/config.json, chmod 600, and replace EVERY value. channelId/ownerId/secret are required; port, userAgent and dshProfile are optional. Get both ids from Discord with developer mode on (right-click the channel / your avatar -> Copy ID). dshProfile is the dsh profile bin/dsh-relay launches - any profile works once the bundle is installed into it; omit it and the wrapper uses DSH_RELAY_PROFILE, else headless. Never commit the real file.",
+  "channelId": "111111111111111111",
+  "ownerId": "222222222222222222",
+  "secret": "replace-me",
+  "port": 8790,
+  "userAgent": "DiscordBot (https://example.com/dsh-discord-relay, 1.0)",
+  "dshProfile": "headless"
+}

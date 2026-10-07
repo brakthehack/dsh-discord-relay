@@ -1,0 +1,26 @@
+{
+  "name": "dsh-relay-bundle",
+  "version": "0.1.0",
+  "description": "dsh plugin bundle: relay blocked ask_user_question prompts + owner answers over a 127.0.0.1 HTTP bridge, delivered to a configurable Discord channel.",
+  "author": "dsh-discord-relay contributors",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dsh.bundle.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh.bundle.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

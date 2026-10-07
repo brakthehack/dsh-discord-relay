@@ -1,0 +1,8 @@
+# dsh-relay-bundle layer.
+# Mounted when the profile's package.json lists dsh-relay-bundle in
+# dsh.profile.bundles (`dsh plugin --profile <profile> add file:<path>`; the
+# profile is an operator choice, this repo ships no favorite); the loader
+# resolves `name` from the profile's node_modules, exactly like billion-context.
+- insert:
+    - id: dsh-discord-relay
+      name: dsh-relay-bundle

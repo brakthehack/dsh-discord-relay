@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Launch dsh for relayed work on a profile the OPERATOR chose.
+#
+# Which profile carries the relay bundle is a personal choice, so precedence is:
+#   1. "dshProfile" in the shared config file (install.sh records what it used)
+#   2. DSH_RELAY_PROFILE in the environment
+#   3. "headless" - the profile dsh ships and auto-initializes, so a first run
+#      needs no extra setup. Any other profile works the same way once
+#      `dsh plugin --profile <profile> add file:<path>/dsh-relay-bundle` ran.
+#
+# The in-process bridge reads the config file at boot; DSH_RELAY_SECRET in the
+# process environment is only a fallback the config file wins over. Without
+# either, ask_user_question fails fast (RELAY_UNCONFIGURED) instead of hanging.
+set -euo pipefail
+
+DEFAULT_PROFILE="headless"
+CONFIG_FILE="${DSH_RELAY_CONFIG:-$HOME/.config/dsh-discord-relay/config.json}"
+
+configured_profile() { # the optional "dshProfile" value, empty when the file has none
+  [ -f "$1" ] || return 0
+  sed -n 's/.*"dshProfile"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | tail -1
+}
+
+PROFILE="$(configured_profile "$CONFIG_FILE")"          # 1. the file's choice
+PROFILE="${PROFILE:-${DSH_RELAY_PROFILE:-$DEFAULT_PROFILE}}"   # 2. env, 3. shipped default
+printf 'dsh-relay: profile %s\n' "$PROFILE" >&2
+
+exec dsh --profile "$PROFILE" "$@"
