@@ -203,8 +203,8 @@ def load_config(env: Optional[Dict[str, str]] = None,
     """Build the relay config from ONE personal JSON file (never checked in).
 
     ``channelId``/``ownerId``/``secret`` are required there — there is no
-    shipped default for someone else's inbox — while ``port`` (8790) and
-    ``userAgent`` are optional. The secret alone also falls back to
+    shipped default for someone else's inbox — while ``port`` (8790, the base of
+    the probe window), ``portSpan`` (20) and ``userAgent`` are optional. The secret alone also falls back to
     ``DSH_RELAY_SECRET`` (env, then the installer-owned ``~/.hermes/.env``);
     the file wins whenever it has one. Every gap raises ``ConfigError``
     naming the path and carrying ``SETUP_HINT``.
