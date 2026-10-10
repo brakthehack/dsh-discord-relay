@@ -10,12 +10,15 @@ go through here so the two halves cannot drift.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------- Discord budgets
@@ -35,6 +38,19 @@ STYLE_DANGER = 4
 
 CUSTOM_ID_PREFIX = "dshr"
 DEFAULT_PORT = 8790
+# The configured port is a BASE. Every dsh process hosts its own bridge on the
+# first free port of this window and the poller walks the same window, so
+# concurrent sessions deliver without any coordination file (DECISIONS.md 11).
+DEFAULT_PORT_SPAN = 20
+MAX_PORT_SPAN = 64
+PORT_SPAN_ENV = "DSH_RELAY_PORT_SPAN"
+
+# What a port must answer on /v1/health to count as one of our bridges: a scan
+# of a port window must never mean poking strangers' servers.
+BRIDGE_IDENTITY = "dsh-bridge"
+PROTOCOL_VERSION = 1
+HEALTH_TIMEOUT = 1.0
+DISCOVERY_TTL = 5.0
 
 # Personal settings live in ONE config file that is never checked in (owner
 # ruling 2026-10-06). No defaults for the channel or the owner: a second
@@ -82,16 +98,23 @@ class RelayConfig:
     channel_id: int
     owner_id: int
     port: int = DEFAULT_PORT
+    port_span: int = DEFAULT_PORT_SPAN
     scheme: str = "http"
     host: str = "127.0.0.1"
     poll_interval: float = 1.5
     user_agent: str = DEFAULT_DISCORD_USER_AGENT
     config_path: str = ""
     hermes_env_path: str = field(default_factory=lambda: os.path.expanduser("~/.hermes/.env"))
+    # Request timeout for ordinary bridge calls; probes use HEALTH_TIMEOUT.
+    timeout: float = 10.0
 
     @property
     def base_url(self) -> str:
         return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def window(self) -> str:
+        return window_label(self)
 
 
 def read_env_file(path: str) -> Dict[str, str]:
@@ -197,6 +220,7 @@ def load_config(env: Optional[Dict[str, str]] = None,
     return RelayConfig(
         secret=secret,
         port=_positive_int(conf.get("port"), DEFAULT_PORT),
+        port_span=clamp_span(source.get(PORT_SPAN_ENV) or conf.get("portSpan")),
         channel_id=_require_id(conf, "channelId", path),
         owner_id=_require_id(conf, "ownerId", path),
         user_agent=discord_user_agent(conf.get("userAgent")),
@@ -234,7 +258,13 @@ def decode_custom_id(custom_id: str) -> Optional[tuple[str, str]]:
 
 # ---------------------------------------------------------------- bridge client
 class BridgeError(RuntimeError):
-    pass
+    """A bridge call failed. ``status`` is the HTTP status when there was one,
+    which is how a wrong secret (401, fix the config) is told apart from a
+    process that exited (no status, drop the port)."""
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def _request_json(method: str, url: str, payload: Optional[dict], headers: Dict[str, str],
@@ -266,27 +296,168 @@ def bridge_headers(config: RelayConfig) -> Dict[str, str]:
 
 def fetch_pending(config: RelayConfig) -> List[Dict[str, Any]]:
     """Blocking: questions awaiting an owner answer."""
-    status, payload = _request_json("GET", f"{config.base_url}/v1/pending", None, bridge_headers(config))
+    status, payload = _request_json("GET", f"{config.base_url}/v1/pending", None,
+                                    bridge_headers(config), config.timeout)
     if status != 200:
-        raise BridgeError(f"pending failed: HTTP {status} {payload.get('error')}")
+        # The status travels with the error: a wrong secret (401) is a fixable
+        # config mistake worth keeping the bridge cached for, while a dead or
+        # foreign port is dropped from the window until it reappears.
+        raise BridgeError(f"pending failed: HTTP {status} {payload.get('error')}", status=status)
     questions = payload.get("questions") or []
     return [q for q in questions if isinstance(q, dict) and q.get("token")]
 
 
 def fetch_health(config: RelayConfig) -> Dict[str, Any]:
-    status, payload = _request_json("GET", f"{config.base_url}/v1/health", None, {})
+    status, payload = _request_json("GET", f"{config.base_url}/v1/health", None, {},
+                                    config.timeout)
     if status != 200:
         raise BridgeError(f"health failed: HTTP {status}")
     return payload
+
+
+def is_bridge(payload: Dict[str, Any]) -> bool:
+    """True when a health answer came from a dsh relay bridge we may poll."""
+    return (isinstance(payload, dict)
+            and payload.get("relay") == BRIDGE_IDENTITY
+            and int(payload.get("protocol") or 0) == PROTOCOL_VERSION)
+
+
+# -------------------------------------------------------- bridge window discovery
+def clamp_span(value: Any) -> int:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_PORT_SPAN
+    return min(MAX_PORT_SPAN, max(1, number))
+
+
+def ports_to_try(config: RelayConfig) -> List[int]:
+    """Every port a bridge of this setup may be listening on, base first."""
+    span = clamp_span(getattr(config, "port_span", DEFAULT_PORT_SPAN))
+    return [int(config.port) + offset for offset in range(span)]
+
+
+def window_label(config: RelayConfig) -> str:
+    """The port window in the shape both halves print (`127.0.0.1:8790-8809`)."""
+    ports = ports_to_try(config)
+    first = f"{config.host}:{ports[0]}"
+    return first if len(ports) == 1 else f"{first}-{ports[-1]}"
+
+
+def bridge_at(config: RelayConfig, port: int) -> RelayConfig:
+    """The same setup, addressed at one port of the window."""
+    return replace(config, port=int(port))
+
+
+def _cache_key(config: RelayConfig) -> tuple:
+    fingerprint = hashlib.sha256(config.secret.encode("utf-8")).hexdigest()[:12]
+    return (config.host, int(config.port), clamp_span(config.port_span), fingerprint)
+
+
+# Discovery results, keyed by _cache_key -> (expiry, live bridges). Process
+# state only: nothing is written anywhere, so a restart re-probes the window.
+_BRIDGE_CACHE: Dict[tuple, tuple[float, List[RelayConfig]]] = {}
+
+
+def probe_bridge(config: RelayConfig, port: int) -> Optional[RelayConfig]:
+    """Return the bridge at ``port`` if it identifies itself, else nothing.
+
+    Only ``/v1/health`` is asked, and only a reply naming itself
+    ``dsh-bridge`` on the matching protocol counts, so scanning the window
+    cannot hand a stranger's port a secret or mistake one for a bridge.
+    """
+    probe = replace(bridge_at(config, port), timeout=HEALTH_TIMEOUT)
+    try:
+        return probe if is_bridge(fetch_health(probe)) else None
+    except (BridgeError, OSError, ValueError):
+        return None
+
+
+def discover_bridges(config: RelayConfig,
+                     cache: Optional[Dict[tuple, tuple[float, List[RelayConfig]]]] = None,
+                     now: Optional[float] = None) -> List[RelayConfig]:
+    """Every live bridge in the configured port window, base port first.
+
+    Concurrent dsh processes each host a bridge and only one Hermes poller
+    exists, so delivery means asking them all. Results are cached for
+    ``DISCOVERY_TTL`` seconds because a loopback probe is cheap but 20 per poll
+    would not be, and a newly started session is found within one TTL.
+    """
+    store = _BRIDGE_CACHE if cache is None else cache
+    key = _cache_key(config)
+    moment = time.monotonic() if now is None else now
+    hit = store.get(key)
+    if hit is not None and hit[0] > moment and hit[1]:
+        return hit[1]
+    alive = [bridge for bridge in _probe_window(config) if bridge is not None]
+    store[key] = (moment + DISCOVERY_TTL, alive)
+    return alive
+
+
+def _probe_window(config: RelayConfig) -> List[Optional[RelayConfig]]:
+    ports = ports_to_try(config)
+    if len(ports) == 1:
+        return [probe_bridge(config, ports[0])]
+    with ThreadPoolExecutor(max_workers=min(len(ports), 8),
+                            thread_name_prefix="dsh-relay-probe") as pool:
+        return list(pool.map(lambda port: probe_bridge(config, port), ports))
+
+
+def forget_bridge(config: RelayConfig, bridge: RelayConfig,
+                  cache: Optional[Dict[tuple, tuple[float, List[RelayConfig]]]] = None) -> None:
+    """Drop a bridge we thought was alive (its port answered, then stopped)."""
+    store = _BRIDGE_CACHE if cache is None else cache
+    key = _cache_key(config)
+    hit = store.get(key)
+    if hit is None:
+        return
+    alive = [entry for entry in hit[1] if entry.port != bridge.port]
+    store[key] = (0.0 if len(alive) != len(hit[1]) else hit[0], alive)
+
+
+def collect_pending(
+        config: RelayConfig,
+        cache: Optional[Dict[tuple, tuple[float, List[RelayConfig]]]] = None,
+        errors: Optional[List[tuple]] = None,
+) -> List[tuple[RelayConfig, Dict[str, Any]]]:
+    """Pending questions of every live bridge, each paired with its bridge.
+
+    The pair is what makes an answer routable: ``post_answer`` must address the
+    process that owns the token, not the base port. A bridge that stops
+    answering mid-poll is dropped from the cache and simply re-appears when it
+    does.
+    """
+    found: List[tuple[RelayConfig, Dict[str, Any]]] = []
+    for bridge in discover_bridges(config, cache=cache):
+        try:
+            for question in fetch_pending(bridge):
+                found.append((bridge, question))
+        except BridgeError as error:
+            # A bridge that answers health but rejects the secret is a real
+            # bridge with a wrong config; forgetting its port would turn a
+            # fixable mistake into silence, which is the failure being removed.
+            if getattr(error, "status", None) in (401, 403):
+                if errors is not None:
+                    errors.append((bridge, error))
+                continue
+            forget_bridge(config, bridge, cache=cache)
+            if errors is not None:
+                errors.append((bridge, error))
+        except (OSError, ValueError) as error:
+            forget_bridge(config, bridge, cache=cache)
+            if errors is not None:
+                errors.append((bridge, error))
+    return found
 
 
 def post_answer(config: RelayConfig, token: str, selected: List[str],
                 custom: Optional[str] = None) -> Dict[str, Any]:
     """Blocking: deliver the owner's answer. Idempotent server-side."""
     status, payload = _request_json("POST", f"{config.base_url}/v1/answer",
-                                    answer_body(token, selected, custom), bridge_headers(config))
+                                    answer_body(token, selected, custom), bridge_headers(config),
+                                    config.timeout)
     if status not in (200, 201):
-        raise BridgeError(f"answer failed: HTTP {status} {payload.get('error')}")
+        raise BridgeError(f"answer failed: HTTP {status} {payload.get('error')}", status=status)
     return payload
 
 

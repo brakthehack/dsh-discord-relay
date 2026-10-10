@@ -319,6 +319,115 @@ check("wrapper: headless is the default when neither is set",
       _invoked(**{"DSH_RELAY_CONFIG": os.path.join(_CFG_TMP, "none.json")})
       == "dsh --profile headless task")
 
+# ---------------------------------------------------------------------------
+# One poller, many bridges (finding 3): window arithmetic, discovery, fan-out.
+# ---------------------------------------------------------------------------
+_WINDOW = _load(_fixture("window.json", {"channelId": str(CHANNEL), "ownerId": str(OWNER),
+                                         "secret": "s", "portSpan": 3}))
+check("portSpan comes from the config file", _WINDOW.port_span == 3, _WINDOW.port_span)
+check("DSH_RELAY_PORT_SPAN overrides the file",
+      _load(_fixture("window.json"), {"DSH_RELAY_PORT_SPAN": "5"}).port_span == 5)
+check("a junk portSpan falls back to the default window",
+      _load(_fixture("spanjunk.json", {"channelId": str(CHANNEL), "ownerId": str(OWNER),
+                                       "secret": "s", "portSpan": "very wide"})).port_span
+      == core.DEFAULT_PORT_SPAN)
+check("ports_to_try walks the configured window",
+      core.ports_to_try(_WINDOW) == [8790, 8791, 8792], core.ports_to_try(_WINDOW))
+check("window_label names the whole window",
+      core.window_label(_WINDOW) == "127.0.0.1:8790-8792", core.window_label(_WINDOW))
+check("window_label collapses a span of one",
+      core.window_label(dataclasses.replace(_WINDOW, port_span=1)) == "127.0.0.1:8790")
+check("clamp_span caps a runaway window", core.clamp_span(9999) == core.MAX_PORT_SPAN)
+check("clamp_span keeps at least one port", core.clamp_span(0) == 1)
+check("health from a foreign server is not a bridge", not core.is_bridge({"ok": True}))
+check("a matching relay bridge is a bridge",
+      core.is_bridge({"ok": True, "relay": core.BRIDGE_IDENTITY, "protocol": core.PROTOCOL_VERSION}))
+check("a future protocol version is not ours to poll",
+      not core.is_bridge({"relay": core.BRIDGE_IDENTITY, "protocol": core.PROTOCOL_VERSION + 1}))
+
+_PROBES = []
+
+
+def _fake_health(config):
+    """Ports 8790/8791 answer the health probe; everything else is dead or foreign."""
+    _PROBES.append(config.port)
+    if config.port in (8790, 8791):
+        return {"ok": True, "relay": core.BRIDGE_IDENTITY, "protocol": core.PROTOCOL_VERSION,
+                "port": config.port}
+    raise core.BridgeError("connect failed: connection refused")
+
+
+_REAL_HEALTH = core.fetch_health
+_REAL_PENDING = core.fetch_pending
+try:
+    core.fetch_health = _fake_health
+    _cache = {}
+    _bridges = core.discover_bridges(_WINDOW, cache=_cache, now=100.0)
+    check("discovery keeps only ports that identify themselves as relay bridges",
+          [b.port for b in _bridges] == [8790, 8791], [b.port for b in _bridges])
+
+    _PROBES.clear()
+    core.discover_bridges(_WINDOW, cache=_cache, now=101.0)
+    check("discovery is cached inside the TTL (no re-probe per poll)", _PROBES == [], _PROBES)
+    core.discover_bridges(_WINDOW, cache=_cache, now=100.0 + core.DISCOVERY_TTL + 1)
+    check("discovery re-probes once the cache ages out", len(_PROBES) == 3, len(_PROBES))
+
+    def _two_pending(config):
+        return [{"token": "t%d" % (config.port - 8790), "question_id": "q1",
+                 "question": "asked on port %d" % config.port}]
+
+    core.fetch_pending = _two_pending
+    _errors = []
+    _pairs = core.collect_pending(_WINDOW, cache=_cache, errors=_errors)
+    check("every bridge's questions are collected, not just the first port's",
+          sorted(q["question"] for _, q in _pairs)
+          == ["asked on port 8790", "asked on port 8791"], _pairs)
+    check("each question is paired with the bridge that owns it",
+          sorted((b.port, q["token"]) for b, q in _pairs) == [(8790, "t0"), (8791, "t1")], _pairs)
+    check("a healthy sweep reports no per-bridge errors", _errors == [], _errors)
+    check("answers travel back to the owning port",
+          core.bridge_at(_WINDOW, 8791).base_url == "http://127.0.0.1:8791",
+          core.bridge_at(_WINDOW, 8791).base_url)
+    check("a question record carries the bridge it came from",
+          "bridge" in [field.name for field in dataclasses.fields(plugin.Prompt)])
+
+    def _wrong_secret_on_8791(config):
+        if config.port == 8791:
+            raise core.BridgeError("pending failed: HTTP 401 unauthorized", status=401)
+        return _two_pending(config)
+
+    core.fetch_pending = _wrong_secret_on_8791
+    _errors = []
+    _pairs = core.collect_pending(_WINDOW, cache=_cache, errors=_errors)
+    check("a wrong secret is reported instead of silently skipping that bridge",
+          len(_errors) == 1 and _errors[0][0].port == 8791
+          and getattr(_errors[0][1], "status", None) == 401, _errors)
+    check("a bridge we cannot auth against stays cached (it is ours; fix the secret)",
+          [b.port for b in core.discover_bridges(_WINDOW, cache=_cache, now=102.0)]
+          == [8790, 8791])
+
+    _errors = []
+    core.fetch_pending = lambda config: (_ for _ in ()).throw(
+        core.BridgeError("pending failed: HTTP 404 no_route"))
+    _pairs = core.collect_pending(_WINDOW, cache=_cache, errors=_errors)
+    check("a bridge that stops serving questions is dropped from the cache",
+          _pairs == [] and len(_errors) == 2, (_pairs, _errors))
+    _PROBES.clear()
+    core.discover_bridges(_WINDOW, cache=_cache, now=103.0)
+    check("dropped bridges are re-probed on the next poll", len(_PROBES) >= 3, len(_PROBES))
+finally:
+    core.fetch_health = _REAL_HEALTH
+    core.fetch_pending = _REAL_PENDING
+
+with open(PKG + "/plugin.yaml", encoding="utf-8") as handle:
+    _manifest = handle.read()
+_declared = [line.strip() for line in _manifest.splitlines()
+             if line.strip().startswith("capabilities:") and not line.lstrip().startswith("#")]
+check("the manifest declares an explicitly empty capability list",
+      _declared == ["capabilities: []"], _declared)
+check("the manifest says why the capability list is empty",
+      "DECISIONS.md" in _manifest, "the deny line must be explained in-repo")
+
 print()
 if FAILURES:
     print("%d check(s) failed: %s" % (len(FAILURES), FAILURES))
