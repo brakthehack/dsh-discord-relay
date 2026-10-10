@@ -1,0 +1,24 @@
+{
+  "name": "dsh-relay-e2e-probe",
+  "version": "0.1.0",
+  "description": "Test fixture: asks ask_user_question once from inside a real dsh process so the relay can be proven end to end without a model.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dsh.bundle.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh.bundle.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

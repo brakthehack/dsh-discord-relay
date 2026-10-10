@@ -13,7 +13,7 @@ dsh session (any profile)                       Hermes gateway
 ┌────────────────────────────┐    poll+POST   ┌────────────────────────────┐
 │ dsh-relay-bundle (Cordis)  │◀──────────────▶│ hermes-relay (discord.py)  │
 │  ask_user_question tool    │   127.0.0.1    │  posts message + buttons   │
-│  in-process HTTP bridge    │   :8790        │  relays the owner's click  │
+│  in-process HTTP bridge    │ :8790-8809     │  relays the owner's click  │
 └────────────────────────────┘                └────────────────────────────┘
 ```
 
@@ -45,18 +45,22 @@ dsh session (any profile)                       Hermes gateway
    `dshProfile` is a personal choice, not a requirement: omit it and the
    wrapper uses `$DSH_RELAY_PROFILE`, else the shipped default `headless`.
 
-2. **Install both halves** into the dsh profile you want the relay in
-   (arg 1 is a one-time choice; `headless` is the profile dsh ships and
-   auto-initializes, so it is the zero-setup default):
+2. **Install both halves into every dsh profile it can find:**
 
    ```sh
-   ./install.sh            # or: ./install.sh my-profile
+   ./install.sh                          # every profile under ~/.dsh/profiles
+   ./install.sh --profiles alpha,beta    # or name the ones you want
+   ./install.sh --uninstall              # reverse it; your config file stays
    ```
 
    It writes/keeps that config file (mode 600, secret and chosen `dshProfile`
-   included), copies `hermes-relay/` to `~/.hermes/plugins/dsh-discord-relay`,
-   and adds `dsh-relay-bundle` to that one profile. It never restarts anything
-   and prints no secret.
+   included), copies `hermes-relay` to `~/.hermes/plugins/dsh-discord-relay`,
+   and adds `dsh-relay-bundle` to each profile. Covering one profile is what
+   left every other session unable to ask, so all-of-them is the default; a
+   profile that already lists the bundle is skipped, and a profile whose install
+   fails is named while the others still finish. It never restarts anything (the
+   running app and gateway pick the change up on their next restart) and prints
+   no secret.
 
 3. **Load the plugin**: restart the Hermes gateway (it imports discord.py from
    its own venv).
@@ -87,7 +91,8 @@ setup hint; nothing is ever guessed.
 | `channelId` | yes | Discord channel where questions land (string or int id) |
 | `ownerId` | yes | the only user id allowed to answer; everyone else gets an ephemeral refusal |
 | `secret` | yes* | shared relay secret (`x-relay-secret` header, constant-time compare) |
-| `port` | no | loopback bridge port, default `8790` |
+| `port` | no | loopback bridge **base** port, default `8790` |
+| `portSpan` | no | size of the port window, default `20` (so `8790`-`8809`), capped at 64 |
 | `userAgent` | no | Discord API UA; keep it `DiscordBot (...)`-shaped |
 | `dshProfile` | no | the dsh profile `bin/dsh-relay` launches (`install.sh` records the one it used) |
 
@@ -103,13 +108,19 @@ operator choice, never a requirement: any profile works once
 Small environment knobs (optional, not personal): `DSH_RELAY_CONFIG` (config
 file path — tests only), `DSH_RELAY_POLL_MS` (relay poll interval, 1500),
 `DSH_RELAY_TIMEOUT_MS` (answer deadline, 600000), `DSH_RELAY_NO_POLL_MS`
-(fail-fast if no relay polls, 90000).
+(fail-fast if no relay polls, 90000), `DSH_RELAY_PORT_SPAN` (window size, 20).
 
 ## What "working" looks like
 
-- `dsh` log: `bridge listening on http://127.0.0.1:8790`
-- `curl -s http://127.0.0.1:8790/v1/health` → `{"ok":true,"pending":0,...}`
-- Hermes log: `dsh-relay: polling http://127.0.0.1:8790 …`
+- `dsh` log: `bridge listening on http://127.0.0.1:8790` - each process takes
+  the first free port in the window, so a second concurrent session logs
+  `…:8791` and a third `…:8792`
+- `for p in $(seq 8790 8809); do curl -s --max-time 1
+  http://127.0.0.1:$p/v1/health; echo; done` → one line per live session:
+  `{"ok":true,"relay":"dsh-bridge","protocol":1,"port":8790,"pending":0,…}`
+- Hermes log: `dsh-discord-relay sweeping 127.0.0.1:8790-8809 for channel …`
+  - one gateway serves every session, and an answer always goes back to the
+  bridge that owns that question
 - A question posts to the channel; clicking an option stamps the message with
   `✅ Answered: <answer>` and the agent continues within a second or two.
 
@@ -130,15 +141,18 @@ file path — tests only), `DSH_RELAY_POLL_MS` (relay poll interval, 1500),
 | Symptom | Meaning |
 | --- | --- |
 | `RELAY_UNCONFIGURED` | config file missing/unparsable or no `secret` — bridge never opens |
-| `RELAY_BIND_FAILED` | port already taken by another process |
+| `RELAY_BIND_FAILED` | every port in the window is taken - raise `portSpan`, or free one; the error names the window |
 | `RELAY_NOT_POLLING` | no Hermes relay polled within `DSH_RELAY_NO_POLL_MS` — *the question was NOT delivered* |
 | `RELAY_ANSWER_TIMEOUT` | relay is live but nobody answered within `DSH_RELAY_TIMEOUT_MS` |
 | `ASK_ABORTED` / `RELAY_STOPPED` | the turn was cancelled / dsh exited with a question open |
 
 Exactly-once semantics survive all of it: answered records are retained briefly
 so a duplicate POST gets `200 {"status":"duplicate"}` instead of a 404, and
-pre-delivery failures call `next()` so another answerer can still take the
-request. Details: [`DECISIONS.md`](DECISIONS.md).
+when two answer surfaces exist (an app profile has its own question card and now
+also this relay) the first answer wins and the other surface is dropped: a stale
+Discord prompt then replies `404 no_such_pending_question`, never a wrong answer.
+A question that could not be delivered says so in the tool result, naming the
+window it tried. Details: [`DECISIONS.md`](DECISIONS.md) 9-12.
 
 ## Develop
 
@@ -168,3 +182,24 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
   disabled:` — read that hint.
 - **Buttons answer but you see nothing** — check the relay is posting into the
   channel in your config file (`channelId`), not a stale one.
+
+- **dsh logged `bridge listening` but nothing arrives in the channel** — sweep
+  the window: every live bridge answers `/v1/health` with
+  `"relay":"dsh-bridge"`. A port that answers with something else is another
+  service and is skipped, not fatal; no port answering at all means the bridge
+  never opened (`RELAY_BIND_FAILED`) or the process is gone.
+- **dsh logs `no userQuestions.registerProvider() here`** - expected for
+  profiles the app did not launch: they have no in-process question card. The
+  relay then answers through its own `ask_user_question` tool and, if the
+  runtime dispatches it, the `user-questions/request` waterfall. The next log
+  line names the routes it actually got (`routes: ...`), so read that
+  instead of assuming.
+- **gateway logs `capability_check … capability=tools.override decision=deny`
+  on a timer** — the loader probes that capability from every plugin
+  unconditionally. The relay does not ask for it (`capabilities: []`) because it
+  overrides nobody's tool; the deny is the intended answer, not a failure. See
+  [`DECISIONS.md`](DECISIONS.md) 12.
+- **A prompt in the channel stops answering with `404`** — the same question was
+  answered in the app first. First answer wins everywhere, and the loser is told
+  so instead of resolving late; a duplicate POST gets `200 {"status":
+  "duplicate"}`.
