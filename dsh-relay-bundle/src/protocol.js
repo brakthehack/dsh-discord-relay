@@ -105,7 +105,22 @@ export function loadConfigFile(env = process.env) {
   }
   out.secret = String(conf.secret ?? '').trim() || String(env[SECRET_FALLBACK_ENV] ?? '').trim()
   if (Number.isFinite(conf.port) && conf.port > 0) out.port = Math.trunc(conf.port)
+  out.portSpan = portSpan(conf, env)
   return out
+}
+
+/** Port-window width from the config file, then the env override, then the default. */
+function portSpan(conf, env) {
+  const raw = env[PORT_SPAN_ENV]
+  if (raw !== undefined && raw !== '') return clampSpan(Number.parseInt(raw, 10))
+  if (Number.isFinite(conf?.portSpan) && conf.portSpan > 0) return clampSpan(Math.trunc(conf.portSpan))
+  return DEFAULT_PORT_SPAN
+}
+
+/** Clamp a declared span into the range that is safe to bind and to poll. */
+export function clampSpan(value) {
+  const n = Number.isFinite(value) ? Math.trunc(value) : DEFAULT_PORT_SPAN
+  return Math.min(MAX_PORT_SPAN, Math.max(1, n))
 }
 
 /**
@@ -122,6 +137,7 @@ export function bridgeConfig(env = process.env) {
     return {
       host: DEFAULT_BRIDGE_HOST,
       port: DEFAULT_BRIDGE_PORT,
+      portSpan: DEFAULT_PORT_SPAN,
       secret: '',
       channelId: '',
       ownerId: '',
@@ -152,6 +168,33 @@ export const MESSAGE_CONTENT_LIMIT = 2000
 
 /** custom_id namespace for this relay (see DECISIONS.md, dispatch truth). */
 export const CUSTOM_ID_PREFIX = 'dshr'
+
+/**
+ * A bridge binds the configured port as a BASE and walks forward through this
+ * window when the base is already taken by another dsh process; the relay half
+ * polls the same window, so concurrent sessions need no coordination file.
+ * `portSpan` in the config file (or DSH_RELAY_PORT_SPAN) widens/narrows it.
+ */
+export const DEFAULT_PORT_SPAN = 20
+export const MAX_PORT_SPAN = 64
+export const PORT_SPAN_ENV = 'DSH_RELAY_PORT_SPAN'
+
+/** Self-identification on /v1/health: what the relay half requires to trust a port. */
+export const BRIDGE_IDENTITY = 'dsh-bridge'
+
+/** Every port the relay half should probe, base first. */
+export function portsToTry(config) {
+  const base = Math.trunc(config.port)
+  const span = clampSpan(config.portSpan)
+  return Array.from({ length: span }, (_, i) => base + i)
+}
+
+/** Human-readable bind window, for logs and for failure text: `127.0.0.1:8790-8809`. */
+export function windowLabel(config) {
+  const ports = portsToTry(config)
+  const first = `${DEFAULT_BRIDGE_HOST}:${ports[0]}`
+  return ports.length === 1 ? first : `${first}-${ports[ports.length - 1]}`
+}
 
 /** UTF-16-safe truncation that keeps the result within `limit` code units. */
 export function truncate(value, limit) {
