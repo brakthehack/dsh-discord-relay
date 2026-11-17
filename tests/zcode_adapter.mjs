@@ -27,7 +27,7 @@ import { ZcodeBridge } from '../zcode-relay/src/bridge.js'
 import { acquireClassLease, classLeasePath, TurnBusyError } from '../zcode-relay/src/classlease.js'
 import { createEventMapper, redact, validateTerminal } from '../zcode-relay/src/events.js'
 import { RouteError, checkPinnedBuild, classKeyOf, readEffectiveRoute } from '../zcode-relay/src/qfn-route.js'
-import { runTurn } from '../zcode-relay/src/runner.js'
+import { runTurn, zcodeChildEnv } from '../zcode-relay/src/runner.js'
 import { runRelayedJob } from '../zcode-relay/src/adapter.js'
 import { MCP_SERVER_PATH } from '../zcode-relay/src/adapter.js'
 
@@ -858,6 +858,34 @@ await check('adapter: a terminal failure is reported as a failure, with the reas
   assert.equal(terminal[0].ok, false)
   assert.match(terminal[0].text, /failed \(provider_error\)/)
   await bridge.stop()
+})
+
+check('the zcode child carries the telemetry-off policy (owner 2026-11-17)', async () => {
+  const env = zcodeChildEnv({
+    PATH: '/usr/bin', HOME: '/tmp/h',
+    OTEL_EXPORTER_OTLP_ENDPOINT: 'https://collector.example.com',
+    OTEL_TRACES_EXPORTER: 'otlp',
+    ZCODE_MODEL_TELEMETRY_ENABLED: '1',
+  })
+  assert.ok(!('OTEL_EXPORTER_OTLP_ENDPOINT' in env), 'a parent OTLP endpoint survives into the worker')
+  assert.ok(!('OTEL_TRACES_EXPORTER' in env), 'a parent exporter survives into the worker')
+  assert.equal(env.ZCODE_MODEL_TELEMETRY_ENABLED, '0', 'the CLI gate must be replaced, not shadowed')
+  assert.equal(env.PATH, '/usr/bin', 'the compose must not lose the inherited environment')
+  // End-to-end: runTurn hands the spawn EXACTLY this composition (settings-file
+  // merge included) — a future refactor back to a bare process.env inherit
+  // fails here, not in a production turn.
+  let spawnedEnv = null
+  const fake = fakeChild({ records: [resultRecord({})] })
+  await runTurn({
+    jobId: 'job-ztel', runId: 'run-ztel', prompt: 'x', cwd: tmpdir(),
+    env: { HOME: '/tmp/h', OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'https://x/v1/traces', ZCODE_MODEL_TELEMETRY_ENABLED: 'true' },
+    settingsFile: '/tmp/zsel.json',
+    spawn: (_bin, _argv, opts) => { spawnedEnv = opts.env; return fake },
+  })
+  assert.ok(spawnedEnv, 'runTurn must hand the spawn an explicit env')
+  assert.ok(!('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT' in spawnedEnv), 'the OTLP channel survives through runTurn')
+  assert.equal(spawnedEnv.ZCODE_MODEL_TELEMETRY_ENABLED, '0')
+  assert.equal(spawnedEnv.ZCODE_CLI_SETTINGS_FILE, '/tmp/zsel.json', 'the settings-file merge must survive the compose')
 })
 
 if (process.exitCode) {

@@ -35,6 +35,23 @@ export const DEFAULT_DISALLOWED_TOOLS = Object.freeze([
 ])
 
 /**
+ * The child environment for one zcode turn: the owner's telemetry-off policy
+ * (2026-11-17), composed the same way pairctl composes it — drop every OTLP
+ * endpoint/exporter so a parent-side variable cannot silently open an export
+ * channel, and pin the CLI's own gate (its off-set reads 0/false/off/disabled)
+ * by REPLACING a parent value, never shadowing it (duplicate keys resolve by
+ * execve order, not by policy).
+ */
+export function zcodeChildEnv(env = process.env) {
+  const drop = ['OTEL_EXPORTER_OTLP_ENDPOINT', 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT',
+    'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT', 'OTEL_TRACES_EXPORTER', 'ZCODE_MODEL_TELEMETRY_ENABLED']
+  const out = {}
+  for (const [k, v] of Object.entries(env)) if (!drop.includes(k)) out[k] = v
+  out.ZCODE_MODEL_TELEMETRY_ENABLED = '0'
+  return out
+}
+
+/**
  * Build the argv for one headless turn.
  *
  * Deliberately explicit: `--mode` and `--disallowed-tools` are passed every
@@ -117,9 +134,10 @@ export async function runTurn(options = {}) {
   // The per-process zcode settings file is selected through the environment
   // (`ZCODE_CLI_SETTINGS_FILE`), never argv: argv is visible in `ps`, and the
   // CLI has no flag for it.
-  const childEnv = settingsFile === undefined || settingsFile === ''
-    ? env
-    : { ...env, ZCODE_CLI_SETTINGS_FILE: String(settingsFile) }
+  const childEnv = zcodeChildEnv(
+    settingsFile === undefined || settingsFile === ''
+      ? env
+      : { ...env, ZCODE_CLI_SETTINGS_FILE: String(settingsFile) })
   const state = {
     exitCode: null,
     signal: null,
