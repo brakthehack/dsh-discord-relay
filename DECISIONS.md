@@ -384,3 +384,61 @@ question can only reach the run that asked it. The adapter stamps each pending
 question with `request_id = job:<jobId>` and carries `session_id` from the
 stream; the answer returns over the existing `/v1/answer` exactly-once path (§2),
 which is where duplicate and stale answers are already handled.
+
+---
+
+## 14. GH-1868 steps 2–4 — what the adapter is, and the two things it does not claim
+
+**The bridge grew one hook, not a second protocol.** `RelayBridge` gains
+`handleExtension(req, res, route)`, which the base class answers with `false`,
+and which `#handle` consults only after the constant-time secret check and only
+after every existing route has declined. That is the whole shared-helper change:
+the dsh half's routes, statuses, exactly-once answer rule, retention windows and
+health shape are the same code with one extra `await` on a no-op, and the dsh
+gates (`bridge_answer`, `ask_flow`, `bridge_ports`, `relay_unit`) pass with the
+same output before and after. Everything zcode-specific — `POST /v1/ask`,
+`GET /v1/events`, `publish()` stamping `job:<id>` — lives in the subclass.
+
+**The question path is MCP because that is the mechanism zcode actually
+offers.** A per-process `setting.json` under `ZCODE_CLI_SETTINGS_FILE` declares
+one stdio server; the model's `ask_user_question` is then a real tool call whose
+result is the owner's answer, and the answer still arrives through the inherited
+`/v1/answer` exactly-once route. `mcp-server.mjs` holds no authority: it reads
+the same supported config file for the secret (the settings file the child is
+declared in contains port, job id and run token, never the secret) and reports
+an undeliverable question as a tool error with the reason, never as an answer.
+
+**Two things the adapter deliberately does *not* claim, so nobody reads silence
+as support:**
+
+1. *It relays runs it hosts.* A human-driven TUI session is not observed. The
+   pinned build also exposes `hooks.events.<Event>` in that same settings file,
+   and a hook could one day report progress or a permission decision — but no
+   measured behaviour shows a hook returning an answer to the model, and the
+   ruling forbids building on an unmeasured protocol. Wiring hooks is the
+   obvious next step, not an existing feature.
+2. *Permission prompts are not relayed as owner questions.* Headless zcode has
+   no documented approval-response channel, so confinement is explicit instead:
+   `--mode` and `--disallowed-tools` are passed on every launch and a mode name
+   alone is never treated as evidence of confinement (M8). Owner interaction is
+   the `ask_user_question` tool. If a future build documents an approval
+   response, the place it lands is another extension route on this bridge.
+
+**Bounded by construction, because a relay that hangs is worse than one that
+lies.** Progress is capped (200 entries) and evicted first under flood; terminal
+events are never evicted before the terminal cap, and the host holds its bridge
+port until the poller has actually drained them or `--hold-ms` expires — a
+missing gateway costs the events, never the exit. The runner consumes stdout and
+stderr continuously with caps, owns the deadline, forwards SIGTERM then SIGKILL,
+and excludes heartbeat records from the stall clock, because a stream of
+heartbeats is exactly what would otherwise age into a fake success. The lease is
+released after the child is reaped and never on a deadline alone.
+
+**Gate receipts for these steps** (full text in the commit bodies):
+`node tests/zcode_adapter.mjs` → `all zcode_adapter checks passed (50 checks)`
+rc=0; `python3 tests/zcode_relay_unit.py` → `all zcode_relay_unit checks passed
+(9 checks)` rc=0; the four pre-existing gates rc=0 unchanged; `node --check` rc=0
+on every touched file; and one live qfn turn through the mapping path in a
+scratch dir outside the repo, rc=0, terminal record
+`response="\n\nPONG-RELAY-1868"`, `usage.source=provider`,
+`projection.status=idle`, `sessionId=sess_90949c93-…`.
