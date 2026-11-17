@@ -198,3 +198,101 @@ identically once `dsh plugin --profile <profile> add` installed the bundle into
 it. Consequences: the wrapper is named for the relay rather than for one
 workflow, `tests/relay_unit.py` pins the precedence instead of a person's
 profile, and docs present `headless` as a default choice, never a requirement.
+
+## 9. The relay owns its own tool and races the surface it finds
+
+Coverage cannot mean "register a tool and hope": the app-launched profiles
+already own the name `ask_user_question` (the app's own bundle mounts it, with
+an in-process answer card), and `ctx.tools.register()` throws on a duplicate —
+which is exactly how the first attempt at this install broke those profiles. So
+the bundle takes the two seams dsh actually offers: a `tools/execute` waterfall
+listener that returns a value without ever calling `next()` for
+`ask_user_question` — that is ownership without registration, and because
+argument validation lives *inside* the registered wrapper it never runs, which
+is what finally kills finding 2 — and a `ctx.tools.get()` probe that registers
+the tool only where nobody else owns it, so a headless profile still has a name
+to call. `ctx.userQuestions.registerProvider()` is opportunistic for the same
+reason: the slot is single-owner, plan-mode asks through it, and a
+`DUPLICATE_PROVIDER` now means "there is a local card, race it" instead of
+throwing during plugin mount.
+
+The race is first-answer-wins across the two surfaces: the local card and the
+Discord bridge run as rivals, whoever answers first settles the ask and the
+loser is dropped (locally through the same abort path the app uses to cancel,
+remotely by deleting the bridge token). Codes that mean "no local surface can
+ask at all" (`NO_PROVIDER`, `ASK_MISSING_AGENT`, `CALLER_NOT_LIVE`,
+`EMPTY_QUESTIONS`, `BAD_INTENT`) delegate: the bridge then *is* the answer path.
+Consequences: an app session keeps its own card (invariant 4 — augmented, not
+amputated); if the card wins, an already-posted Discord prompt goes stale and a
+later click gets `404 no_such_pending_question` rather than recording an answer
+nobody will read; a question whose arguments the model malformed is repaired
+(`id` synthesized as `q1`, JSON-in-a-string parsed, `text`/`question` aliases)
+and the repair is reported back to the asker instead of eating the question;
+`questions` is `required`-free in the relay's own schema because a missing
+argument is a question the model forgot to phrase, not a reason to lose one.
+
+Both seams are therefore wired, and the mount log states which ones it got
+instead of promising a listener the runtime may never call. What was measured on
+this machine, in the e2e gate: an installed 0.1.1-rc.2 profile exposes
+`ctx.userQuestions` with **no** `registerProvider` (so the provider branch is
+`typeof`-gated, not assumed), and the dsh source tree checked out here contains
+no emitter for `'user-questions/request'` either - while this file's own earlier
+section cites that waterfall being dispatched in 0.2.0-rc.2. Two runtimes, two
+different seams, neither verifiable from here: keep both, log the gap, and let
+the tool path carry the proof.
+
+## 10. Install covers every profile it can find
+
+Finding 1 was one profile's worth of coverage, so the installer stopped taking
+a single favorite: with no `--profiles` it installs into every profile directory
+under `$DSH_HOME/profiles` (that is also the profile `dsh` itself resolves),
+`--profiles a,b` narrows it, and one failing profile no longer aborts the others
+— it names them and exits non-zero. It stays idempotent (a profile already
+listing the bundle is skipped, not rewritten) and reversible (`--uninstall`
+removes the bundle from every profile and deletes the installed copy, then says
+plainly which files it left alone on purpose: the one config file and Hermes'
+env file, both holding the operator's own settings). Consequences: a fresh
+`install.sh` now covers every profile directory that exists under the operator's
+`~/.dsh/profiles` in one pass, whatever they are called there; the deviation from the
+original one-profile design is
+only in the installer — `bin/dsh-relay` still resolves the operator's chosen
+profile, because which profile a *person* launches is theirs, and what the relay
+does in any of them is now identical.
+
+## 11. One poller finds every bridge by health-probing a port window
+
+Every dsh process binding the same fixed `127.0.0.1:8790` meant the second
+process to start was silently undeliverable, and its ask waited for a human
+nobody could reach. The fix is a window: each bridge takes the first free port
+in `[port, port + portSpan)` (`portSpan`, default 20, capped at 64) and refuses
+to pretend otherwise when the whole window is taken; the Discord half health-probes
+the same window concurrently and trusts only a reply that identifies itself
+(`relay: "dsh-bridge"`, matching `protocol`), caches the live set for five
+seconds, polls every live bridge, and routes each answer back to the bridge that
+owns its token. A registry/heartbeat file was rejected deliberately: it adds a
+second source of truth about who is alive, liveness is exactly what a crashed
+process lies about, and the health endpoint already answers both questions
+while the shared secret still gates `/v1/pending`. Consequences: no new state on
+disk; a bridge started after the poller is found within `poll_interval` + the
+discovery TTL (~6.5 s worst case), inside the 90 s no-poll budget; a foreign
+service squatting a port in the window is ignored rather than polled; and a
+wrong secret keeps the bridge cached (a fixable config mistake, reported once
+in a while instead of retried every tick) while any other failure drops it until
+it re-identifies itself.
+
+## 12. The `tools.override` capability check is expected noise
+
+The gateway logs `capability_check plugin=dsh-discord-relay
+capability=tools.override decision=deny` on every plugin load, and the check is
+unconditional in `hermes_cli/plugins_loader.py` (`_track_tool_override_policy`
+probes `_tool_override_allowed("")` for every plugin it loads), so no manifest in
+this repo can silence it. The relay does not want that capability: overriding
+another plugin's tool is how an answer surface gets replaced by the wrong one,
+and the relay owns its path through `tools/execute` plus conditional
+registration (§9) instead. So `plugin.yaml` now declares `capabilities: []` and
+`provides_tools: []` — a decision written down rather than an omission — with a
+comment pointing here so the log line reads as intended behavior. Consequences:
+the deny line stays in the gateway log at its existing cadence (the one thing
+this repo cannot change without touching Hermes), the manifest no longer
+triggers the loader's "capabilities must be a list" warning, and anyone reading
+the noise finds the reason in two steps.

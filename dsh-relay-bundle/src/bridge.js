@@ -5,7 +5,8 @@
  * Wire protocol (every request except GET /v1/health requires header
  * `x-relay-secret` equal to DSH_RELAY_SECRET; comparison is constant time):
  *
- *   GET  /v1/health   -> { ok, pending, last_poll_age_ms }          (no auth)
+ *   GET  /v1/health   -> { ok, relay, protocol, port, pending,             (no auth)
+ *                          last_poll_age_ms }
  *   GET  /v1/pending  -> { questions: [ QuestionSpec ] }
  *   POST /v1/answer   <- { token } | { request_id, question_id },
  *                        { selected: string[], custom?: string }
@@ -21,7 +22,16 @@
 
 import { createServer } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { labelize, shortToken, truncate, MESSAGE_CONTENT_LIMIT } from './protocol.js'
+import {
+  BRIDGE_IDENTITY,
+  MESSAGE_CONTENT_LIMIT,
+  PROTOCOL_VERSION,
+  labelize,
+  portsToTry,
+  shortToken,
+  truncate,
+  windowLabel,
+} from './protocol.js'
 
 const MAX_BODY_BYTES = 64 * 1024
 /** How long an answered question stays known so a duplicate click is idempotent. */
@@ -35,6 +45,7 @@ function log(...args) {
 
 function secretEquals(expected, given) {
   if (typeof given !== 'string') return false
+  if (typeof expected !== 'string' || expected === '') return false
   const a = Buffer.from(expected, 'utf8')
   const b = Buffer.from(given, 'utf8')
   if (a.length !== b.length) return false
@@ -69,27 +80,54 @@ export class RelayBridge {
     this.server = undefined
     this.ready = undefined
     this.closed = false
+    // Actual bound port; starts as the window base and moves forward on EADDRINUSE.
+    this.port = config.port
   }
 
-  /** Bind the socket; resolves once listening, rejects on bind failure. */
+  /**
+   * Bind the socket; resolves once listening, rejects once the whole window is
+   * exhausted. The configured port is a BASE, not a claim: concurrent dsh
+   * processes each host their own bridge, so a taken base walks forward
+   * through the port window (see protocol.js `portsToTry`), which is exactly
+   * the window the Discord half polls.
+   */
   start() {
     if (this.ready !== undefined) return this.ready
-    this.ready = new Promise((resolve, reject) => {
+    this.ready = this.#bindWindow(portsToTry(this.config), [])
+    return this.ready
+  }
+
+  #bindWindow(candidates, tried) {
+    const port = candidates[0]
+    const rest = candidates.slice(1)
+    return new Promise((resolve, reject) => {
       const server = createServer((req, res) => {
         this.#handle(req, res).catch(error => {
           log('handler error', error?.message ?? error)
           this.#json(res, 500, { ok: false, error: 'bridge_error' })
         })
       })
-      server.once('error', error => {
-        this.ready = undefined
-        reject(error)
-      })
+      const moveOn = error => {
+        server.removeAllListeners('error')
+        server.close(() => {})
+        const attempted = [...tried, port]
+        if (rest.length === 0) {
+          // Let a later ask retry the window from the base.
+          this.ready = undefined
+          reject(new Error(
+            `no free bridge port in ${windowLabel(this.config)} (${error?.code ?? error?.message ?? error})`))
+          return
+        }
+        this.#bindWindow(rest, attempted).then(resolve, reject)
+      }
+      server.once('error', moveOn)
       // 127.0.0.1 only: never reachable off-box.
-      server.listen(this.config.port, '127.0.0.1', () => resolve(server))
-      this.server = server
+      server.listen(port, '127.0.0.1', () => {
+        this.port = port
+        this.server = server
+        resolve(server)
+      })
     })
-    return this.ready
   }
 
   async stop() {
@@ -181,13 +219,22 @@ export class RelayBridge {
     if (route === 'GET /v1/health') {
       this.#json(res, 200, {
         ok: true,
+        // Handshake: the Discord half only trusts a port that identifies as a
+        // bridge of this protocol, so scanning the window cannot pick up an
+        // unrelated local server.
+        relay: BRIDGE_IDENTITY,
+        protocol: PROTOCOL_VERSION,
+        port: this.port,
         pending: [...this.pending.values()].filter(r => !r.answered).length,
         last_poll_age_ms: this.lastPollAt === 0 ? null : Date.now() - this.lastPollAt,
       })
       return
     }
 
-    if (this.config.secret === '') {
+    if (!this.config.secret) {
+      // No secret to authenticate the relay with: answering 401 here would read as
+      // 'the relay has the wrong secret', which sends the operator hunting the
+      // wrong file. 503 says the bridge itself is not in service.
       this.#json(res, 503, {
         ok: false,
         error: 'bridge_unconfigured: ' + (this.config.configError?.split('\n')[0]

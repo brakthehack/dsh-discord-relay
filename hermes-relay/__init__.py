@@ -89,8 +89,8 @@ def _spawn(runner: "RelayRunner", loop: asyncio.AbstractEventLoop) -> None:
     if runner.task is not None and not runner.task.done():
         return
     runner.task = loop.create_task(runner.run(), name="dsh-discord-relay-poll")
-    log.info("dsh-discord-relay polling %s for channel %s", runner.config.base_url,
-             runner.config.channel_id)
+    log.info("dsh-discord-relay sweeping %s for channel %s",
+             core.window_label(runner.config), runner.config.channel_id)
 
 
 def _install_backstop(native, runner: "RelayRunner") -> None:
@@ -127,6 +127,10 @@ class Prompt:
     token: str
     question: Dict[str, Any]
     multi: bool
+    # Which dsh process owns this token. Answers must go back to that port, not
+    # to the base of the window, or a concurrent session's answer lands on a
+    # bridge that never asked (and gets a 404 the owner can see).
+    bridge: Any = None
     message: Any = None
     view: Any = None
     resolved: bool = False
@@ -157,8 +161,11 @@ class RelayRunner:
     # ------------------------------------------------------------ poll loop
     async def run(self) -> None:
         while self._running:
+            errors: List[tuple] = []
             try:
-                questions = await core.ahead(core.fetch_pending, self.config)
+                # One poller, every bridge: each dsh process owns a port of the
+                # window, and a question is only delivered by asking its owner.
+                found = await core.ahead(core.collect_pending, self.config, None, errors)
                 self._bridge_failures = 0
             except Exception as error:
                 self._bridge_failures += 1
@@ -167,21 +174,28 @@ class RelayRunner:
                     log.debug("dsh bridge not reachable (%d): %s", self._bridge_failures, error)
                 await asyncio.sleep(max(self.config.poll_interval, 2.0))
                 continue
+            for bridge, error in errors:
+                # Reachable but unusable is the loud case: a wrong secret or a
+                # half-upgrade means questions nobody will ever see.
+                self._bridge_failures += 1
+                if self._bridge_failures in (1, 20, 200) or getattr(error, "status", None) in (401, 403):
+                    log.warning("dsh bridge on port %s is not usable: %s (fix the shared secret in %s)",
+                                bridge.port, error, self.config.config_path)
             try:
-                await self._reconcile(questions)
+                await self._reconcile(found)
             except Exception:
                 log.exception("dsh-discord-relay reconcile failed")
             await asyncio.sleep(self.config.poll_interval)
 
-    async def _reconcile(self, questions: List[Dict[str, Any]]) -> None:
+    async def _reconcile(self, found: List[Tuple[Any, Dict[str, Any]]]) -> None:
         for token in [t for t, p in self.prompts.items() if p.resolved]:
             self.prompts.pop(token, None)
-        for question in questions:
+        for bridge, question in found:
             token = str(question.get("token") or "")
             if not token or token in self.prompts:
                 continue
             try:
-                await self._post_question(token, question)
+                await self._post_question(token, question, bridge)
             except Exception:
                 log.exception("could not post dsh question %s to Discord", token)
 
@@ -191,8 +205,10 @@ class RelayRunner:
             channel = await self.client.fetch_channel(self.config.channel_id)
         return channel
 
-    async def _post_question(self, token: str, question: Dict[str, Any]) -> None:
-        prompt = Prompt(token=token, question=question, multi=bool(question.get("multi_select")))
+    async def _post_question(self, token: str, question: Dict[str, Any],
+                             bridge: Any = None) -> None:
+        prompt = Prompt(token=token, question=question, multi=bool(question.get("multi_select")),
+                        bridge=bridge)
         self.prompts[token] = prompt  # registered first: a click must never lose state
         channel = await self.channel()
         content = core.message_content(question, self.config.owner_id)
@@ -213,7 +229,10 @@ class RelayRunner:
             prompt.in_flight = False
 
     async def _resolve(self, prompt: Prompt, selected: List[str], custom: Optional[str]) -> Tuple[str, str]:
-        payload = await core.ahead(core.post_answer, self.config, prompt.token, selected, custom)
+        # Answer the process that asked. `config` alone would address the base of
+        # the window, which under concurrency is somebody else's bridge.
+        payload = await core.ahead(core.post_answer, prompt.bridge or self.config,
+                                   prompt.token, selected, custom)
         status = str(payload.get("status") or "")
         text = core.answer_to_text(selected, custom)
         if status == "duplicate":

@@ -15,8 +15,10 @@
 ## Gates (both must pass before a PR)
 
 ```sh
-python3 tests/relay_unit.py
-node tests/bridge_answer.mjs
+python3 tests/relay_unit.py          # needs discord.py: HERMES_VENV=<hermes venv>
+node tests/bridge_answer.mjs         # real bridge, real HTTP, real answer
+node tests/bridge_ports.mjs          # concurrent bridges in one port window
+node tests/ask_flow.mjs              # argument repair, delivery failure, races
 ```
 
 `relay_unit.py` re-execs itself under a python that can `import discord` when
@@ -32,6 +34,10 @@ bash -n install.sh bin/dsh-relay
 node --check dsh-relay-bundle/src/protocol.js
 node --check dsh-relay-bundle/src/bridge.js
 node --check dsh-relay-bundle/src/index.js
+node --check dsh-relay-bundle/src/ask.js
+node --check tests/e2e_second_bridge.mjs
+node --check tests/e2e-probe-bundle/src/index.js
+bash -n tests/e2e_profile.sh
 ```
 
 ## Invariants worth not breaking

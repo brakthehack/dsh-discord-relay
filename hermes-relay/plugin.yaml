@@ -7,4 +7,11 @@ description: >-
   agent over the local dsh bridge.
 author: dsh-discord-relay contributors
 kind: standalone
+# Deliberately empty, not an omission (DECISIONS.md 12). This plugin registers
+# no tools and overrides no tool: it polls the local dsh bridge and posts to
+# one Discord channel, through its own HTTP client. `tools.override` is only
+# ever checked here because the loader probes every plugin for it, so the
+# periodic `capability_check ... decision=deny` line is a probe of a capability
+# we do not want — leaving it undeclared would keep that noise unexplained.
+capabilities: []
 provides_tools: []

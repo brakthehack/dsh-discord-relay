@@ -1,0 +1,9 @@
+# dsh-relay-e2e-probe layer (test fixture only; never installed by install.sh).
+#
+# Installed into a throwaway profile by tests/e2e_profile.sh, which is what
+# makes an end-to-end proof possible without model credentials: the relay's own
+# mount order is not ours to control, so the probe waits for the tool to appear
+# and then drives the real ask path.
+- insert:
+    - id: dsh-relay-e2e-probe
+      name: dsh-relay-e2e-probe
