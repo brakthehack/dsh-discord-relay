@@ -572,3 +572,162 @@ def answer_to_text(selected: List[str], custom: Optional[str]) -> str:
     if typed:
         return typed
     return "; ".join(chosen) or "(empty)"
+
+
+# ------------------------------------------------------------ zcode relay events
+#
+# The zcode half of the relay (GH-1868 step 5, DECISIONS.md §13) puts the run's
+# progress and its one terminal outcome on the same authenticated 127.0.0.1
+# bridge the questions already use, so this poller drains them alongside
+# `/v1/pending`. Three rules the rendering below enforces, straight from the
+# invariants:
+#
+#   - M6: only `ok is True` renders as completed. A terminal event with a
+#     missing, absent or non-boolean `ok` is an unverified outcome and is shown
+#     as a failure — a progress line, a truncated stream or a heartbeat-only
+#     stall can never read as success here either.
+#   - M9: everything is labelled with the job it belongs to, and an event id is
+#     only ever posted once per bridge, so a redelivered queue entry cannot
+#     print a second "completed".
+#   - Bounded: progress is coalesced into one message per poll and clipped;
+#     a chatty worker cannot flood the channel.
+EVENT_PROGRESS = "progress"
+EVENT_TERMINAL = "terminal"
+MAX_EVENT_BATCH = 40
+PROGRESS_COALESCE_LIMIT = 8
+PROGRESS_LINE_LIMIT = 200
+
+#: job key -> set of event ids already delivered (process state, bounded).
+_EVENT_SEEN: Dict[str, set] = {}
+_EVENT_SEEN_MAX = 400
+
+
+def fetch_events(config: RelayConfig, after: int = 0,
+                 limit: int = MAX_EVENT_BATCH) -> Dict[str, Any]:
+    """Blocking: relay events with ``seq > after`` from one bridge."""
+    url = f"{config.base_url}/v1/events?after={int(after)}&limit={int(limit)}"
+    status, payload = _request_json("GET", url, None, bridge_headers(config), config.timeout)
+    if status != 200:
+        raise BridgeError(f"events failed: HTTP {status} {payload.get('error')}", status=status)
+    events = payload.get("events")
+    if not isinstance(events, list):
+        raise BridgeError("events failed: malformed payload", status=status)
+    return {
+        "events": [e for e in events if isinstance(e, dict)],
+        "max_seq": int(payload.get("max_seq") or payload.get("maxSeq") or after),
+        "job_id": str(payload.get("job_id") or payload.get("jobId") or ""),
+    }
+
+
+def cursor_key(bridge: RelayConfig) -> tuple:
+    return (bridge.host, int(bridge.port))
+
+
+def collect_events(
+        config: RelayConfig,
+        cursors: Dict[tuple, int],
+        cache: Optional[Dict[tuple, tuple[float, List[RelayConfig]]]] = None,
+        errors: Optional[List[tuple]] = None,
+) -> List[tuple[RelayConfig, Dict[str, Any]]]:
+    """Every new relay event of every live bridge, each paired with its bridge.
+
+    The cursor advances only after the events were handed back, so a poll that
+    dies mid-delivery re-reads the same events instead of losing the outcome.
+    """
+    found: List[tuple[RelayConfig, Dict[str, Any]]] = []
+    for bridge in discover_bridges(config, cache=cache):
+        key = cursor_key(bridge)
+        after = cursors.get(key, 0)
+        try:
+            batch = fetch_events(bridge, after=after)
+        except BridgeError as error:
+            # 404 = a bridge too old to know about events: normal, not an error
+            # worth logging every poll and not a reason to forget the port.
+            if getattr(error, "status", None) == 404:
+                continue
+            if getattr(error, "status", None) in (401, 403):
+                if errors is not None:
+                    errors.append((bridge, error))
+                continue
+            forget_bridge(config, bridge, cache=cache)
+            if errors is not None:
+                errors.append((bridge, error))
+            continue
+        except (OSError, ValueError) as error:
+            forget_bridge(config, bridge, cache=cache)
+            if errors is not None:
+                errors.append((bridge, error))
+            continue
+        events = batch["events"]
+        if events:
+            cursors[key] = max([after] + [int(e.get("seq") or 0) for e in events])
+        for event in events:
+            found.append((bridge, event))
+    return found
+
+
+def already_delivered(event: Dict[str, Any]) -> bool:
+    """True when this exact event has been posted before (per job, bounded)."""
+    job = str(event.get("job_id") or event.get("jobId") or "")
+    event_id = str(event.get("id") or "")
+    if job == "" or event_id == "":
+        return False
+    seen = _EVENT_SEEN.setdefault(job, set())
+    if event_id in seen:
+        return True
+    seen.add(event_id)
+    if len(seen) > _EVENT_SEEN_MAX:
+        _EVENT_SEEN[job] = set(list(seen)[-_EVENT_SEEN_MAX:])
+    return False
+
+
+def forget_job(job_id: str) -> None:
+    _EVENT_SEEN.pop(str(job_id), None)
+
+
+def is_success(event: Dict[str, Any]) -> bool:
+    """M6: exactly boolean True, and only on a terminal event."""
+    return (str(event.get("kind") or "") == EVENT_TERMINAL
+            and event.get("ok") is True
+            and str(event.get("reason") or "") in ("", "null", "None"))
+
+
+def render_event_text(event: Dict[str, Any], owner_id: Optional[int] = None) -> Optional[str]:
+    """The channel line for one event, or None when it must not be posted.
+
+    Never a guess: an unrecognised kind is dropped rather than invented, and a
+    terminal event whose outcome was not verified reads as a failure.
+    """
+    kind = str(event.get("kind") or "")
+    job = str(event.get("job_id") or event.get("jobId") or "job")
+    session = str(event.get("session_id") or event.get("sessionId") or "")
+    label = f"`{job}`" + (f" · `{session}`" if session else "")
+    body = clip(str(event.get("text") or "").strip(), PROGRESS_LINE_LIMIT)
+
+    if kind == EVENT_PROGRESS:
+        if body == "":
+            return None
+        return f"⏳ zcode {label} — {body}"
+
+    if kind == EVENT_TERMINAL:
+        reason = str(event.get("reason") or "")
+        if is_success(event):
+            return f"✅ zcode {label} completed — {body}"
+        verdict = reason if reason not in ("", "null", "None") else "unverified_outcome"
+        return f"❌ zcode {label} FAILED ({verdict}) — {body}"
+
+    return None
+
+
+def coalesce_progress(events: List[Dict[str, Any]], owner_id: Optional[int] = None) -> Optional[str]:
+    """One message for a run of progress lines from the same job."""
+    lines: List[str] = []
+    for event in events[:PROGRESS_COALESCE_LIMIT]:
+        text = render_event_text(event, owner_id)
+        if text is not None:
+            lines.append(text)
+    if not lines:
+        return None
+    if len(events) > PROGRESS_COALESCE_LIMIT:
+        lines.append(f"… {len(events) - PROGRESS_COALESCE_LIMIT} more progress lines suppressed")
+    return "\n".join(lines)[:MESSAGE_CONTENT_LIMIT]

@@ -110,6 +110,68 @@ file path — tests only), `DSH_RELAY_POLL_MS` (relay poll interval, 1500),
 `DSH_RELAY_TIMEOUT_MS` (answer deadline, 600000), `DSH_RELAY_NO_POLL_MS`
 (fail-fast if no relay polls, 90000), `DSH_RELAY_PORT_SPAN` (window size, 20).
 
+The zcode lane adds three knobs, all operational rather than personal:
+`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` (which provider config the route is read
+from — the relay only reads it), `DSH_RELAY_ZCODE_STATE_DIR` (where a run's
+per-process settings file and scratch state go, default `/tmp/zcode-relay`) and
+`DSH_RELAY_ZCODE_ALLOW_UNPINNED=1` (run a build other than the one the event
+mapping was validated against; see DECISIONS.md §13). `QFN_CLASS_LEASE_DIR`
+relocates the shared capacity lease, which is how a test box isolates it.
+
+## Relaying a zcode run (the qfn lane)
+
+A qfn worker can run on zcode instead of dsh (`zcode-app-cli 3.18.2-47` /
+`zcode-runtime 0.17.1`, the pair the mapping is validated against). This
+replaces nothing on the dsh side: the same Discord plugin, the same one config
+file and the same authenticated `127.0.0.1` bridge serve both, and dsh stays the
+fallback lane.
+
+```sh
+node zcode-relay/bin/zcode-relay.mjs run \
+  --prompt '…' --cwd /path/to/workspace \
+  [--resume sess_…] [--job-id ID] [--mode build] \
+  [--disallowed-tools 'Bash Edit Write'] [--deadline-ms 600000] [--hold-ms 20000]
+```
+
+- **Progress and one terminal outcome** come from the child's
+  `--output-format stream-json` stream, mapped to a fixed vocabulary
+  (`turn started`, `model streaming (n chunks)`, `running <tool>`,
+  `turn completed — n tool calls`) and delivered by the existing poller as
+  `⏳ zcode \`job\` · \`sess_…\` — …`, then exactly one terminal line:
+  `✅ … completed — <excerpt> — usage: in/out/total, n requests`, or
+  `❌ … FAILED (reason) — …`. Prompt text is never relayed, and an outcome that
+  is not the adapter's own validated `ok: true` reads
+  `FAILED (unverified_outcome)`. Completion needs exit 0 **and** a terminal
+  `result` record, so a truncated stream, an empty response, a provider error,
+  a signal, a deadline or a heartbeat-only stall is a failure with a named
+  reason.
+- **Owner questions reach the blockers channel once and come back once.** The
+  run declares one stdio MCP server for its own process
+  (`ZCODE_CLI_SETTINGS_FILE`), so the model's `ask_user_question` is a real tool
+  call whose result is the owner's answer. A duplicate click stays idempotent,
+  an answer that arrives after the run ended is a 404, and an undeliverable
+  question fails with a code (`RELAY_NOT_POLLING`, `RELAY_ANSWER_TIMEOUT`)
+  instead of hanging the worker.
+- **One admitted qfn job per model class**, from the same file lease pairctl
+  takes (`/tmp/qfn-class-lease`). A second run of the same class — any harness
+  name, any provider alias — gets `turn_busy` and launches nothing; the lease
+  is released only after the child is reaped.
+- **The route, or nothing.** The effective provider id, model id and baseUrl
+  are read read-only out of the pinned provider config and must be exactly
+  `epyc` / `qwen38-flashnext` / `http://192.168.86.250:8086/v1`; the retired
+  `:8080` is refused by host:port. No API key passes through the relay, and no
+  global zcode setting is edited: the run's MCP declaration and session DB live
+  in the host's state dir.
+
+The config file is the same one — `channelId`, `ownerId`, `secret`, and the
+optional `port`/`portSpan`/`userAgent`. **No new keys are needed**, and the
+zcode settings file never contains the secret: the MCP child reads the config
+file itself. To prove the round trip by hand without a model in the loop:
+
+```sh
+node zcode-relay/bin/zcode-relay.mjs ask --question 'Ship it?' --option Yes --option No
+```
+
 ## What "working" looks like
 
 - `dsh` log: `bridge listening on http://127.0.0.1:8790` - each process takes
@@ -159,7 +221,22 @@ window it tried. Details: [`DECISIONS.md`](DECISIONS.md) 9-12.
 ```sh
 python3 tests/relay_unit.py        # protocol/UI unit gate
 node tests/bridge_answer.mjs       # bridge answer-semantics gate
+node tests/ask_flow.mjs            # ask-path race + failure codes
+node tests/bridge_ports.mjs        # bridge port-window gate
+node tests/zcode_adapter.mjs       # zcode lane: correlation, one outcome,
+                                   # question round trip, M2 lease, M1 route
+python3 tests/zcode_relay_unit.py  # zcode events on the Discord half
 ```
+
+`tests/relay_unit.py` needs the interpreter that has discord.py: run it with
+that python, or set `HERMES_VENV=<venv that has it>`.
+
+The zcode gates spawn no `zcode` process and open no provider connection: the
+child is a scripted stream so every failure branch is deterministic, and the
+question path is exercised with a real MCP child process against a simulated
+poller. A live turn on the real route is deliberately not part of the suite —
+it costs a qfn slot, so it is run as a supervised smoke outside the repo
+(`zcode-relay/bin/zcode-relay.mjs run …`, see the lane section above).
 
 End-to-end against the real channel (needs the config file + a bot token):
 
