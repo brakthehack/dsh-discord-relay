@@ -149,6 +149,8 @@ class RelayRunner:
         self.answer_modal = answer_modal
         self.disabled_view = disabled_view
         self.prompts: Dict[str, Prompt] = {}
+        # bridge (host, port) -> last relay event seq delivered (zcode lane).
+        self.event_cursors: Dict[Any, int] = {}
         self.task: Optional[asyncio.Task] = None
         self._running = True
         self._bridge_failures = 0
@@ -185,7 +187,56 @@ class RelayRunner:
                 await self._reconcile(found)
             except Exception:
                 log.exception("dsh-discord-relay reconcile failed")
+            try:
+                # zcode lane (GH-1868 step 5): the same poller carries progress
+                # and the one terminal outcome, so a zcode run is as visible as
+                # a dsh one and a stalled run never reads as finished.
+                await self._drain_events()
+            except Exception:
+                log.exception("dsh-discord-relay event drain failed")
             await asyncio.sleep(self.config.poll_interval)
+
+    # ------------------------------------------------------- zcode event drain
+    async def _drain_events(self) -> None:
+        """Pull each bridge's new relay events and deliver them, once each."""
+        errors: List[tuple] = []
+        found = await core.ahead(core.collect_events, self.config, self.event_cursors, None, errors)
+        for bridge, error in errors:
+            if getattr(error, "status", None) in (401, 403):
+                log.warning("zcode relay bridge on port %s rejects the shared secret: %s",
+                            bridge.port, error)
+        if not found:
+            return
+
+        progress: Dict[str, List[Dict[str, Any]]] = {}
+        terminals: List[Dict[str, Any]] = []
+        for _bridge, event in found:
+            if core.already_delivered(event):
+                continue
+            kind = str(event.get("kind") or "")
+            if kind == core.EVENT_TERMINAL:
+                terminals.append(event)
+            elif kind == core.EVENT_PROGRESS:
+                job = str(event.get("job_id") or event.get("jobId") or "job")
+                progress.setdefault(job, []).append(event)
+
+        for job, events in progress.items():
+            body = core.coalesce_progress(events, self.config.owner_id)
+            if body:
+                await self._post_event_text(body)
+        for event in terminals:
+            # One terminal outcome is its own message: it is the thing the owner
+            # is waiting for, and it must never be buried under a progress run.
+            body = core.render_event_text(event, self.config.owner_id)
+            if body:
+                await self._post_event_text(body)
+            job = str(event.get("job_id") or event.get("jobId") or "")
+            if job:
+                core.forget_job(job)
+
+    async def _post_event_text(self, text: str) -> None:
+        channel = await self.channel()
+        await channel.send(content=text)
 
     async def _reconcile(self, found: List[Tuple[Any, Dict[str, Any]]]) -> None:
         for token in [t for t, p in self.prompts.items() if p.resolved]:

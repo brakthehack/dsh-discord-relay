@@ -1,0 +1,17 @@
+{
+  "name": "zcode-relay-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "zcode-facing event/question adapter for dsh-discord-relay (GH-1868 step 5)",
+  "bin": { "zcode-relay": "bin/zcode-relay.mjs" },
+  "exports": {
+    "./adapter": "./src/adapter.js",
+    "./bridge": "./src/bridge.js",
+    "./events": "./src/events.js",
+    "./runner": "./src/runner.js",
+    "./classlease": "./src/classlease.js",
+    "./qfn-route": "./src/qfn-route.js",
+    "./settings": "./src/settings.js"
+  }
+}

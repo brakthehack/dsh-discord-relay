@@ -275,7 +275,25 @@ export class RelayBridge {
       return
     }
 
+    // Route-extension seam (DECISIONS.md §13): an adapter that hosts this
+    // bridge for a non-dsh worker may claim routes of its own. The base class
+    // claims nothing, so every request a dsh process makes is answered by the
+    // routes above and reaches 404 exactly as it always did — the seam is a
+    // subclass hook, not a change to this protocol. It runs *after* the secret
+    // check, so an extension route can never be unauthenticated.
+    if (await this.handleExtension(req, res, route)) return
+
     this.#json(res, 404, { ok: false, error: 'no_route', route })
+  }
+
+  /**
+   * Optional hook for subclasses that host the bridge for another harness
+   * (`zcode-relay/src/bridge.js`). Return true when the response is written.
+   * The base implementation claims nothing, which is what keeps the dsh half
+   * behavior-identical to the version before this hook existed.
+   */
+  async handleExtension(_req, _res, _route) {
+    return false
   }
 
   #answer(body) {
